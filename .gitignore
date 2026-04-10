@@ -1,0 +1,11 @@
+# Ignore everything by default
+/*
+
+# But track these
+!.gitignore
+!code/
+!sbatch_scripts/
+
+# Within tracked dirs, still ignore common junk
+code/**/.DS_Store
+sbatch_scripts/**/.DS_Store

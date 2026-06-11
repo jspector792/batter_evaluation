@@ -15,8 +15,7 @@ from sklearn.metrics import r2_score
 
 warnings.filterwarnings('ignore')
 
-FASTBALL_TYPES = {"FF", "SI", "FC", "FT"}
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = os.path.join(BASE_DIR, "data", "fastballs_2025")
 OUT_DIR  = os.path.join(BASE_DIR, "out")
 os.makedirs(OUT_DIR, exist_ok=True)

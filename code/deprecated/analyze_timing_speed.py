@@ -1,22 +1,21 @@
 """
-Does pitch speed shift the optimal timing angle?
+Does pitch speed shift the optimal timing (in)?
 
-Hypothesis: faster pitches force batters to make contact earlier (more negative
-timing angle), so the bimodal peak-timing distribution may reflect hitters
-facing different speed profiles rather than two distinct swing archetypes.
+Timing proxy: intercept_y − population median (inches), pull/early-positive.
+Swing filter: ALL_SWINGS (in-play + fouls + swinging strikes / misses).
+
+Hypothesis: faster pitches force batters to change their bat-ball intercept
+position at contact — the bimodal peak-timing distribution may partly reflect
+hitters facing different speed profiles.
 
 Tests:
-  1. Population-level LW-vs-timing curves by speed quartile — does the peak shift?
-  2. Within-hitter paired comparison (Q1 slow vs Q4 fast peaks) — does the SAME
-     hitter peak earlier on faster pitches?
-  3. Per-hitter peak distributions by speed quartile — does the bimodality change?
-  4. Speed sensitivity (Q4 − Q1 peak shift) vs hitter features — who adjusts most?
-
-Speed quartiles (population, in-play fastballs):
-  Q1 ≤ 91.8 mph | Q2 91.8–93.8 | Q3 93.8–95.7 | Q4 > 95.7 mph
+  1. Population-level LW vs timing curves by speed quartile
+  2. Within-hitter paired comparison (Q1 slow vs Q4 fast peaks)
+  3. Per-hitter peak distributions by speed quartile
+  4. Speed sensitivity (Q4 − Q1 peak shift) vs hitter features
 """
 
-import os, glob, warnings
+import os, sys, glob, warnings
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -26,25 +25,26 @@ import seaborn as sns
 from scipy.stats import gaussian_kde, pearsonr, ttest_rel, ttest_ind
 from sklearn.mixture import GaussianMixture
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+from timing_utils import (ALL_SWINGS, CONTACT, IN_PLAY,
+                          INTERCEPT_X, INTERCEPT_Y,
+                          add_timing, smoothed_peak, binned_lw,
+                          TIMING_AXIS_LABEL, FASTBALL_TYPES, INSIDE_Z, MIDDLE_Z, OUTSIDE_Z, add_zone_and_matchup)
+
 warnings.filterwarnings('ignore')
 
-FASTBALL_TYPES = {"FF", "SI", "FC", "FT"}
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = os.path.join(BASE_DIR, "data", "fastballs_2025")
 OUT_DIR  = os.path.join(BASE_DIR, "out")
-IN_PLAY  = {'hit_into_play', 'hit_into_play_no_out', 'hit_into_play_score'}
-MIN_PA_SEASON = 50   # full-season GMM
-MIN_PA_BIN    = 15   # per-hitter per speed bin
-POLY_SEASON   = 4
-POLY_BIN      = 3    # lower degree for smaller samples
-N_BINS        = 30   # bins for LW-vs-timing curves
+MIN_PA_SEASON = 50
+MIN_PA_BIN    = 15
+N_BINS        = 30
 
 COLS = [
     "pitch_type", "batter", "stand", "p_throws",
-    "intercept_ball_minus_batter_pos_x_inches",
-    "intercept_ball_minus_batter_pos_y_inches",
     "delta_run_exp", "description", "release_speed",
     "bat_speed", "attack_angle", "swing_path_tilt",
+    INTERCEPT_X, INTERCEPT_Y,
     "launch_speed", "launch_angle", "launch_speed_angle",
 ]
 
@@ -53,19 +53,14 @@ files  = sorted(glob.glob(os.path.join(DATA_DIR, "*.csv")))
 chunks = [pd.read_csv(f, usecols=COLS) for f in files]
 df = pd.concat(chunks, ignore_index=True)
 df = df[df['pitch_type'].isin(FASTBALL_TYPES)].copy()
-df = df[df['description'].isin(IN_PLAY)].copy()
+df = df[df['description'].isin(ALL_SWINGS)].copy()
 
-IX = 'intercept_ball_minus_batter_pos_x_inches'
-IY = 'intercept_ball_minus_batter_pos_y_inches'
-df = df.dropna(subset=[IX, IY, 'delta_run_exp', 'stand', 'release_speed'])
-print(f"In-play fastballs: {len(df):,}")
+df = df.dropna(subset=['delta_run_exp', 'stand', 'release_speed'])
+df = df.dropna(subset=[INTERCEPT_Y, 'delta_run_exp'])
+center = add_timing(df)
+print(f"Swings: {len(df):,}  (timing centre = {center:.2f} in)")
 
-# Timing angle
-df['timing_raw'] = np.degrees(np.arctan2(df[IX], df[IY]))
-TIMING_MED = df['timing_raw'].median()
-df['timing'] = df['timing_raw'] - TIMING_MED
-
-# Speed quartiles (population boundaries)
+# Speed quartiles
 Q_BOUNDS = df['release_speed'].quantile([.25, .5, .75]).values
 labels = [
     f"Q1 (≤{Q_BOUNDS[0]:.1f})",
@@ -83,20 +78,16 @@ print(df.groupby('speed_q', observed=True)['pitch_type']
         .value_counts().unstack(fill_value=0))
 
 # ── Peak-finding helper ───────────────────────────────────────────────────────
-def peak_timing(data, min_n, degree):
+def peak_timing(data, min_n, **kw):
+    """Per-hitter peak (in) — NaN unless statistically significant."""
     if len(data) < min_n:
         return np.nan
-    x = data['timing'].values
-    y = data['delta_run_exp'].values
-    try:
-        p = np.poly1d(np.polyfit(x, y, degree))
-        lo, hi = np.percentile(x, 5), np.percentile(x, 95)
-        xs = np.linspace(lo, hi, 500)
-        return float(xs[np.argmax(p(xs))])
-    except Exception:
-        return np.nan
+    loc, _, _, sig = smoothed_peak(data['timing'].values,
+                                    data['delta_run_exp'].values,
+                                    min_n=min_n, **kw)
+    return loc if sig else np.nan
 
-# ── LW-vs-timing curve helper ─────────────────────────────────────────────────
+# ── LW-vs-attack-angle curve helper ──────────────────────────────────────────
 def lw_curve(data, n_bins=N_BINS):
     data = data.dropna(subset=['timing', 'delta_run_exp'])
     if len(data) < 200:
@@ -113,53 +104,69 @@ def lw_curve(data, n_bins=N_BINS):
           .dropna().reset_index())
     return g
 
-# ── Full-season peaks + GMM ───────────────────────────────────────────────────
-print("\nFitting full-season GMM...")
+# ── Full-season peaks + GMM (GMM uses ALL spline peaks, sig or not) ──────────
+def peak_all(data, min_n):
+    if len(data) < min_n:
+        return np.nan
+    loc, _, _, _ = smoothed_peak(data['timing'].values,
+                                  data['delta_run_exp'].values,
+                                  min_n=min_n)
+    return loc
+
+print("\nFitting full-season GMM (on all spline peaks)...")
 season_peaks = (df.groupby('batter')
-                  .apply(lambda g: peak_timing(g, MIN_PA_SEASON, POLY_SEASON))
+                  .apply(lambda g: peak_all(g, MIN_PA_SEASON))
                   .dropna()
                   .rename('peak'))
+season_peaks_sig = (df.groupby('batter')
+                      .apply(lambda g: peak_timing(g, MIN_PA_SEASON))
+                      .rename('peak_sig'))
+n_sig_season = int(season_peaks_sig.notna().sum())
+print(f"  Hitters with any spline peak:   {len(season_peaks)}")
+print(f"  Hitters with significant peak:  {n_sig_season}  "
+      f"({n_sig_season/len(season_peaks):.1%})")
+
 gmm = GaussianMixture(n_components=2, random_state=42, covariance_type='full')
 gmm.fit(season_peaks.values.reshape(-1, 1))
 gm_means = gmm.means_.flatten()
-early_idx = int(np.argmin(gm_means))
-late_idx  = int(np.argmax(gm_means))
+oppo_idx = int(np.argmin(gm_means))
+pull_idx = int(np.argmax(gm_means))
 
 def assign_mode(val):
     if np.isnan(val): return np.nan
-    return 'early' if np.argmax(gmm.predict_proba([[val]])[0]) == early_idx else 'late'
+    return 'oppo' if np.argmax(gmm.predict_proba([[val]])[0]) == oppo_idx else 'pull'
 
 season_df = pd.DataFrame({
     'peak_season': season_peaks,
     'mode_season': season_peaks.apply(assign_mode),
     'stand': df.groupby('batter')['stand'].agg(lambda s: s.mode()[0]),
 })
-print(f"  early-peak: μ={gm_means[early_idx]:.1f}°")
-print(f"  late-peak:  μ={gm_means[late_idx]:.1f}°")
+print(f"  oppo-peak: μ={gm_means[oppo_idx]:.1f} in")
+print(f"  pull-peak: μ={gm_means[pull_idx]:.1f} in")
 
-# ── Population-level peak per speed bin ──────────────────────────────────────
+# ── Population-level peak per speed bin (significance-filtered) ─────────────
 pop_peaks = {}
 for q in labels:
     sub = df[df['speed_q'] == q]
-    pk = peak_timing(sub, min_n=200, degree=POLY_SEASON)
+    pk = peak_timing(sub, min_n=200)
     pop_peaks[q] = pk
-    print(f"  Population peak [{q}]: {pk:.1f}°  (n={len(sub):,})")
+    pk_str = f"{pk:.1f} in" if not np.isnan(pk) else "n.s."
+    print(f"  Population peak [{q}]: {pk_str}  (n={len(sub):,})")
 
-# ── Per-hitter peaks by speed bin ────────────────────────────────────────────
-print("\nComputing per-hitter peaks by speed quartile...")
+# ── Per-hitter peaks by speed bin (significance-filtered) ───────────────────
+print("\nComputing per-hitter peaks by speed quartile (significance filtered)...")
 bin_peaks = {}
 for q in labels:
     sub = df[df['speed_q'] == q]
     peaks_q = (sub.groupby('batter')
-                  .apply(lambda g: peak_timing(g, MIN_PA_BIN, POLY_BIN))
+                  .apply(lambda g: peak_timing(g, MIN_PA_BIN))
                   .dropna()
                   .rename('peak'))
     bin_peaks[q] = peaks_q
     print(f"  {q}: {len(peaks_q)} hitters  "
-          f"mean={peaks_q.mean():.1f}°  median={peaks_q.median():.1f}°  "
-          f"std={peaks_q.std():.1f}°")
+          f"mean={peaks_q.mean():.1f} in  median={peaks_q.median():.1f} in  "
+          f"std={peaks_q.std():.1f} in")
 
-# Within-hitter Q1 vs Q4 paired comparison
 q1_label, q4_label = labels[0], labels[3]
 paired_speed = (
     pd.DataFrame({'Q1': bin_peaks[q1_label], 'Q4': bin_peaks[q4_label]})
@@ -170,20 +177,20 @@ paired_speed['shift'] = paired_speed['Q4'] - paired_speed['Q1']
 t_pair, p_pair = ttest_rel(paired_speed['Q1'], paired_speed['Q4'])
 r_q1q4, p_r = pearsonr(paired_speed['Q1'], paired_speed['Q4'])
 print(f"\nWithin-hitter Q1 vs Q4 paired comparison (n={len(paired_speed)}):")
-print(f"  Q1 (slow) mean={paired_speed['Q1'].mean():.1f}°  "
-      f"Q4 (fast) mean={paired_speed['Q4'].mean():.1f}°")
-print(f"  Mean shift (Q4 − Q1) = {paired_speed['shift'].mean():.1f}°")
+print(f"  Q1 (slow) mean={paired_speed['Q1'].mean():.1f} in  "
+      f"Q4 (fast) mean={paired_speed['Q4'].mean():.1f} in")
+print(f"  Mean shift (Q4 − Q1) = {paired_speed['shift'].mean():.1f} in")
 print(f"  Paired t-test: t={t_pair:.3f}  p={p_pair:.4f}")
 print(f"  Cross-speed correlation: r={r_q1q4:.3f}  p={p_r:.4f}")
-print(f"  % hitters peaking earlier on fast pitches: "
+print(f"  % hitters with lower peak timing on fast pitches: "
       f"{(paired_speed['shift'] < 0).mean():.1%}")
 
-# ── Per-hitter features (for sensitivity analysis) ────────────────────────────
 feat_cols = ['bat_speed', 'attack_angle', 'swing_path_tilt',
              'launch_speed', 'launch_angle', 'launch_speed_angle']
 feat_means = df.groupby('batter')[feat_cols].mean().add_suffix('_mean')
-barrel_rate = (df.assign(barrel=(df['launch_speed_angle']==6).astype(float))
-                 .groupby('batter')['barrel'].mean().rename('barrel_rate'))
+barrel_rate = (df[df['description'].isin(IN_PLAY)]
+               .assign(barrel=(lambda d: (d['launch_speed_angle']==6).astype(float)))
+               .groupby('batter')['barrel'].mean().rename('barrel_rate'))
 mean_speed_faced = df.groupby('batter')['release_speed'].mean().rename('mean_speed_faced')
 paired_speed = paired_speed.join(feat_means).join(barrel_rate).join(mean_speed_faced)
 
@@ -191,10 +198,10 @@ paired_speed = paired_speed.join(feat_means).join(barrel_rate).join(mean_speed_f
 # FIGURES
 # ═══════════════════════════════════════════════════════════════════════════════
 
-COLORS = ['#2166ac', '#74add1', '#f46d43', '#d73027']  # cool→warm for slow→fast
-MODE_COLORS = {'early': '#1f77b4', 'late': '#d62728'}
+COLORS = ['#2166ac', '#74add1', '#f46d43', '#d73027']
+MODE_COLORS = {'oppo': '#1f77b4', 'pull': '#d62728'}
 
-# ── Fig 1: Population LW-vs-timing curves by speed quartile ──────────────────
+# ── Fig 1: Population LW-vs-attack-angle curves by speed quartile ────────────
 fig1, axes1 = plt.subplots(1, 2, figsize=(16, 6))
 
 ax = axes1[0]
@@ -208,7 +215,6 @@ for q, color in zip(labels, COLORS):
                     alpha=0.10, color=color)
     ax.plot(g['mid'], g['mean_lw'], color=color, lw=2.2, marker='o', ms=3,
             label=f"{q}  (n={len(df[df['speed_q']==q]):,})")
-    # mark peak
     pk = pop_peaks[q]
     if not np.isnan(pk):
         pk_lw = g.loc[(g['mid'] - pk).abs().idxmin(), 'mean_lw']
@@ -216,26 +222,28 @@ for q, color in zip(labels, COLORS):
 
 ax.axhline(0, color='black', lw=0.8, ls='--')
 ax.axvline(0, color='grey', lw=0.8, ls=':')
-ax.set_xlabel("Timing Angle (°, centred on population median)\n← early (pull-side)   late (oppo-side) →",
-              fontsize=10)
+ax.set_xlabel(TIMING_AXIS_LABEL, fontsize=10)
 ax.set_ylabel("Mean Δ Run Expectancy", fontsize=10)
 ax.set_title("LW vs Timing by Pitch Speed Quartile\n"
-             "(dots = estimated population peak)", fontsize=11)
+             "(dots = estimated population peak, significance-filtered)", fontsize=11)
 ax.legend(fontsize=8)
 
-# Panel 2: bar chart of population peak by speed quartile
 ax = axes1[1]
 pk_vals = [pop_peaks[q] for q in labels]
-bars = ax.bar(range(4), pk_vals, color=COLORS, edgecolor='k', lw=0.5, alpha=0.85)
+bars = ax.bar(range(4), [0 if np.isnan(v) else v for v in pk_vals],
+              color=COLORS, edgecolor='k', lw=0.5, alpha=0.85)
 ax.axhline(0, color='black', lw=1, ls='--')
 ax.set_xticks(range(4))
 ax.set_xticklabels(labels, fontsize=9, rotation=10)
-ax.set_ylabel("Population Peak Timing Angle (°)", fontsize=10)
-ax.set_title("Population Peak Timing by Speed Quartile\n"
-             "← more early = further below 0", fontsize=11)
+ax.set_ylabel("Population Peak Timing (in)", fontsize=10)
+ax.set_title("Population Peak Timing by Speed Quartile", fontsize=11)
 for i, (bar, val) in enumerate(zip(bars, pk_vals)):
+    if np.isnan(val):
+        ax.text(bar.get_x() + bar.get_width()/2, 0.05,
+                "n.s.", ha='center', va='bottom', fontsize=10, color='grey')
+        continue
     ax.text(bar.get_x() + bar.get_width()/2, val + (0.3 if val >= 0 else -0.8),
-            f"{val:.1f}°", ha='center', va='bottom' if val >= 0 else 'top', fontsize=10)
+            f"{val:.1f} in", ha='center', va='bottom' if val >= 0 else 'top', fontsize=10)
 
 plt.tight_layout()
 fig1.savefig(os.path.join(OUT_DIR, 'speed_1_population_curves.png'), dpi=180, bbox_inches='tight')
@@ -245,9 +253,8 @@ print("\nSaved speed_1_population_curves.png")
 # ── Fig 2: Within-hitter Q1 vs Q4 scatter + shift distribution ───────────────
 fig2, axes2 = plt.subplots(1, 3, figsize=(20, 6))
 
-# Panel 1: Q1 vs Q4 scatter coloured by full-season mode
 ax = axes2[0]
-for mode, color, marker in [('early', '#1f77b4', 'o'), ('late', '#d62728', '^')]:
+for mode, color, marker in [('oppo', '#1f77b4', 'o'), ('pull', '#d62728', '^')]:
     sub = paired_speed[paired_speed['mode_season'] == mode]
     ax.scatter(sub['Q1'], sub['Q4'], c=color, alpha=0.4, s=18, marker=marker,
                label=f"{mode}-peak (n={len(sub)})")
@@ -257,14 +264,13 @@ ax.plot([lo, hi], [lo, hi], 'k--', lw=1.2, label='y = x (no shift)')
 ax.axhline(0, color='grey', lw=0.6, ls=':')
 ax.axvline(0, color='grey', lw=0.6, ls=':')
 mean_shift = paired_speed['shift'].mean()
-ax.set_xlabel(f"Peak Timing — Slow pitches {q1_label} (°)", fontsize=10)
-ax.set_ylabel(f"Peak Timing — Fast pitches {q4_label} (°)", fontsize=10)
+ax.set_xlabel(f"Peak Timing — Slow pitches {q1_label} (in)", fontsize=10)
+ax.set_ylabel(f"Peak Timing — Fast pitches {q4_label} (in)", fontsize=10)
 ax.set_title(f"Within-Hitter: Slow vs Fast Peak Timing\n"
-             f"r={r_q1q4:.3f}  mean shift={mean_shift:+.1f}°  "
+             f"r={r_q1q4:.3f}  mean shift={mean_shift:+.1f} in  "
              f"paired t p={p_pair:.4f}  n={len(paired_speed)}", fontsize=10)
 ax.legend(fontsize=8)
 
-# Panel 2: distribution of shift (Q4 - Q1)
 ax = axes2[1]
 shifts = paired_speed['shift'].values
 ax.hist(shifts, bins=30, edgecolor='k', lw=0.4, color='slategrey', alpha=0.75, density=True)
@@ -272,19 +278,16 @@ xs = np.linspace(shifts.min(), shifts.max(), 300)
 ax.plot(xs, gaussian_kde(shifts)(xs), 'k-', lw=2)
 ax.axvline(0, color='black', lw=1.2, ls='--', label='No shift')
 ax.axvline(shifts.mean(), color='red', lw=2, ls=':',
-           label=f"Mean shift = {shifts.mean():+.1f}°")
-pct_earlier = (shifts < 0).mean()
-ax.set_xlabel("Peak Timing Shift: Fast − Slow (°)\n< 0 = earlier on fast pitches", fontsize=10)
+           label=f"Mean shift = {shifts.mean():+.1f} in")
+pct_lower = (shifts < 0).mean()
+ax.set_xlabel("Peak Timing Shift: Fast − Slow (in)\n< 0 = lower (more oppo/late) peak on fast pitches", fontsize=10)
 ax.set_ylabel("Density", fontsize=10)
 ax.set_title(f"Distribution of Within-Hitter Speed Shift\n"
-             f"{pct_earlier:.0%} of hitters peak earlier on fast pitches", fontsize=10)
+             f"{pct_lower:.0%} of hitters have lower peak timing on fast pitches", fontsize=10)
 ax.legend(fontsize=9)
 
-# Panel 3: all 4 quartile means per hitter (paired lines for a sample)
 ax = axes2[2]
-# Compute all 4 quartile peaks per hitter
 all_q_wide = pd.DataFrame({q: bin_peaks[q] for q in labels}).dropna(how='all')
-# For a random sample of 40 hitters, draw lines
 np.random.seed(42)
 sample = all_q_wide.dropna(thresh=3).sample(min(60, len(all_q_wide.dropna(thresh=3))))
 x_pos = range(4)
@@ -296,13 +299,11 @@ for batter in sample.index:
     valid_x = [labels.index(l) for l in valid.index]
     ax.plot(valid_x, valid.values, color='grey', alpha=0.2, lw=0.8)
 
-# Overlay per-quartile mean with CI
 means_q = [bin_peaks[q].mean() for q in labels]
 sems_q  = [bin_peaks[q].sem()  for q in labels]
 ax.errorbar(x_pos, means_q, yerr=[1.96*s for s in sems_q],
             color='black', lw=2.5, capsize=5, marker='o', ms=7,
             label='Mean ± 95% CI (all hitters)', zorder=5)
-# Also show by mode
 for mode, color in MODE_COLORS.items():
     mode_batters = season_df[season_df['mode_season'] == mode].index
     mode_means = [bin_peaks[q].reindex(mode_batters).dropna().mean() for q in labels]
@@ -311,7 +312,7 @@ for mode, color in MODE_COLORS.items():
 ax.axhline(0, color='grey', lw=0.8, ls=':')
 ax.set_xticks(range(4))
 ax.set_xticklabels(labels, fontsize=8, rotation=10)
-ax.set_ylabel("Per-Hitter Peak Timing Angle (°)", fontsize=10)
+ax.set_ylabel("Per-Hitter Peak Timing (in)", fontsize=10)
 ax.set_title("Peak Timing vs Speed Quartile\n"
              "Grey = individual hitters, black = population mean", fontsize=10)
 ax.legend(fontsize=8)
@@ -321,10 +322,9 @@ fig2.savefig(os.path.join(OUT_DIR, 'speed_2_within_hitter.png'), dpi=180, bbox_i
 plt.close(fig2)
 print("Saved speed_2_within_hitter.png")
 
-# ── Fig 3: Per-hitter peak distributions by speed quartile — bimodality ───────
+# ── Fig 3: Per-hitter peak distributions by speed quartile ───────────────────
 fig3, axes3 = plt.subplots(1, 2, figsize=(16, 6))
 
-# Panel 1: KDE per speed quartile overlaid
 ax = axes3[0]
 for q, color in zip(labels, COLORS):
     vals = bin_peaks[q].values
@@ -332,8 +332,7 @@ for q, color in zip(labels, COLORS):
         continue
     xs = np.linspace(vals.min(), vals.max(), 400)
     ax.plot(xs, gaussian_kde(vals)(xs), color=color, lw=2.5,
-            label=f"{q}  μ={vals.mean():.1f}°  σ={vals.std():.1f}°")
-    # GMM fit per quartile
+            label=f"{q}  μ={vals.mean():.1f} in  σ={vals.std():.1f} in")
     if len(vals) >= 20:
         gq = GaussianMixture(n_components=2, random_state=42)
         gq.fit(vals.reshape(-1, 1))
@@ -345,14 +344,13 @@ for q, color in zip(labels, COLORS):
             ax.plot(xs, w * norm.pdf(xs, m, np.sqrt(v)),
                     color=color, lw=1, ls=':', alpha=0.5)
 
-ax.axvline(0, color='black', lw=1, ls='--', label='Neutral (0°)')
-ax.set_xlabel("Per-Hitter Peak Timing Angle (°)", fontsize=10)
+ax.axvline(0, color='black', lw=1, ls='--', label='0 in (median)')
+ax.set_xlabel("Per-Hitter Peak Timing (in)", fontsize=10)
 ax.set_ylabel("Density", fontsize=10)
 ax.set_title("Per-Hitter Peak Distribution by Speed Quartile\n"
              "Dotted = GMM 2-component fit per quartile", fontsize=11)
 ax.legend(fontsize=8)
 
-# Panel 2: violin plot of per-hitter peaks by quartile
 ax = axes3[1]
 data_vio = pd.concat(
     [pd.DataFrame({'peak': bin_peaks[q], 'quartile': q}) for q in labels],
@@ -362,9 +360,9 @@ sns.violinplot(data=data_vio, x='quartile', y='peak', palette=COLORS,
                ax=ax, inner='box', cut=0, order=labels)
 ax.axhline(0, color='black', lw=1, ls='--')
 ax.set_xticklabels(labels, rotation=12, fontsize=8)
-ax.set_ylabel("Per-Hitter Peak Timing Angle (°)", fontsize=10)
+ax.set_ylabel("Per-Hitter Peak Timing (in)", fontsize=10)
 ax.set_xlabel("Speed Quartile", fontsize=10)
-ax.set_title("Distribution of Per-Hitter Peaks by Speed Quartile\n"
+ax.set_title("Distribution of Per-Hitter Peak Timing by Speed Quartile\n"
              "(box = IQR, white dot = median)", fontsize=11)
 
 plt.tight_layout()
@@ -373,7 +371,6 @@ plt.close(fig3)
 print("Saved speed_3_distributions.png")
 
 # ── Fig 4: Speed sensitivity vs hitter features ───────────────────────────────
-# Speed sensitivity = Q4 peak − Q1 peak (more negative = bigger early shift on fast)
 SENSE_FEATS = [
     ('bat_speed_mean',        'Bat Speed (mph)'),
     ('attack_angle_mean',     'Attack Angle (°)'),
@@ -394,7 +391,6 @@ for col, label in SENSE_FEATS:
     r, p = pearsonr(sub['shift'], sub[col])
     print(f"  {label:<35} {r:>8.3f} {p:>8.4f}")
     corr_rows.append({'col': col, 'label': label, 'r': r, 'p': p})
-corr_sense = pd.DataFrame(corr_rows)
 
 NCOLS_F, NROWS_F = 4, 2
 fig4, axes4 = plt.subplots(NROWS_F, NCOLS_F, figsize=(6*NCOLS_F, 5*NROWS_F))
@@ -403,11 +399,10 @@ axes4 = axes4.flatten()
 for i, (col, label) in enumerate(SENSE_FEATS):
     ax = axes4[i]
     sub = paired_speed[['shift', col, 'mode_season', 'stand']].dropna()
-    for mode, color, marker in [('early','#1f77b4','o'), ('late','#d62728','^')]:
+    for mode, color, marker in [('oppo','#1f77b4','o'), ('pull','#d62728','^')]:
         s = sub[sub['mode_season'] == mode]
         ax.scatter(s[col], s['shift'], c=color, alpha=0.35, s=14, marker=marker,
                    label=f"{mode} (n={len(s)})")
-    # regression
     x_all = sub[col].values
     y_all = sub['shift'].values
     m, b = np.polyfit(x_all, y_all, 1)
@@ -417,7 +412,7 @@ for i, (col, label) in enumerate(SENSE_FEATS):
     pstr = f"{p:.3f}" if p >= 0.001 else "<0.001"
     ax.axhline(0, color='grey', lw=0.8, ls=':')
     ax.set_xlabel(label, fontsize=9)
-    ax.set_ylabel("Speed Sensitivity: Q4 − Q1 (°)\n< 0 = earlier on fast pitches", fontsize=8)
+    ax.set_ylabel("Speed Sensitivity: Q4 − Q1 (in)\n< 0 = lower peak timing on fast pitches", fontsize=8)
     ax.set_title(f"{label}\nr={r:.3f}  p={pstr}", fontsize=9)
     if i == 0:
         ax.legend(fontsize=7)
@@ -426,7 +421,7 @@ for j in range(i + 1, len(axes4)):
     axes4[j].set_visible(False)
 
 fig4.suptitle("Who Adjusts Timing Most for Pitch Speed?\n"
-              "Speed sensitivity = peak timing Q4 (fast) − Q1 (slow)",
+              "Speed sensitivity = peak timing (in) Q4 (fast) − Q1 (slow)",
               fontsize=13, y=1.01)
 plt.tight_layout()
 fig4.savefig(os.path.join(OUT_DIR, 'speed_4_sensitivity.png'), dpi=180, bbox_inches='tight')

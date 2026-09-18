@@ -35,7 +35,7 @@ warnings.filterwarnings('ignore')
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = os.path.join(BASE_DIR, "data", "fastballs_2025")
-OUT_DIR  = os.path.join(BASE_DIR, "out")
+OUT_DIR  = os.path.join(BASE_DIR, "out", "exploratory", "deprecated")
 MIN_PA_SEASON = 50
 MIN_PA_BIN    = 15
 N_BINS        = 30

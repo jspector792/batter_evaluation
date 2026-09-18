@@ -29,7 +29,7 @@ warnings.filterwarnings('ignore')
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = os.path.join(BASE_DIR, "data", "fastballs_2025")
-OUT_DIR  = os.path.join(BASE_DIR, "out")
+OUT_DIR  = os.path.join(BASE_DIR, "out", "exploratory", "deprecated")
 
 MIN_SWING_PERIOD  = 20   # all-swing samples needed to compute timing peak
 MIN_INPLAY_PERIOD = 15   # in-play balls needed for stable xwOBA

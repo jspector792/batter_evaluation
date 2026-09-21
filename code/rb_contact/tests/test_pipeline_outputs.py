@@ -34,7 +34,12 @@ class TestReproducibility(unittest.TestCase):
             self.skipTest(f'No snapshot existed -- froze current output as the baseline at {SNAPSHOT_PATH}. '
                           f'Re-run this test after the NEXT full pipeline run to actually check reproducibility.')
 
+        # prepare_data() casts `batter` to str, so the parquet holds strings
+        # while read_csv infers int64 -- without normalizing, the two sets are
+        # disjoint and this test fails on a perfectly reproducible pipeline.
         snapshot = pd.read_csv(SNAPSHOT_PATH)
+        current['batter'] = current['batter'].astype(str)
+        snapshot['batter'] = snapshot['batter'].astype(str)
         self.assertEqual(set(current['batter']), set(snapshot['batter']),
                          'batter set changed between runs -- not a pure re-run regression')
 

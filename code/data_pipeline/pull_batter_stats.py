@@ -137,6 +137,55 @@ def add_ids(df: pd.DataFrame, reg: pd.DataFrame,
 # 2. FANGRAPHS BATTING STATS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _finish_bref_season_fallback(fg: pd.DataFrame,
+                                  reg: pd.DataFrame) -> pd.DataFrame:
+    """
+    Finish the batting_stats_bref fallback used when FanGraphs is unreachable.
+
+    batting_stats_bref returns season totals keyed by 'mlbID' (an MLBAM ID),
+    so batter_id comes straight off that column and only the name needs to be
+    joined from the register. Season stats are BRef's, not FanGraphs' — the
+    advanced FanGraphs-only columns (wRC+, WAR, Spd, batted-ball rates) are
+    NOT recoverable this way, so expect a much narrower fg_ block than a
+    successful FanGraphs pull.
+    """
+    id_col = next((c for c in ['mlbID', 'mlb_ID', 'mlbam_id']
+                   if c in fg.columns), None)
+    if id_col is None:
+        print(f'  WARNING: BRef fallback has no MLBAM ID column. '
+              f'Columns: {fg.columns.tolist()}')
+        print('  NOTE: output will have ZERO fg_ columns.')
+        return pd.DataFrame()
+
+    fg = fg.rename(columns={id_col: 'batter_id'})
+    fg['batter_id'] = pd.to_numeric(fg['batter_id'],
+                                     errors='coerce').astype('Int64')
+    fg = fg.dropna(subset=['batter_id'])
+
+    # Aggregate away multi-team rows: BRef lists a traded player once per
+    # stint, and a duplicated batter_id would fan out the downstream merge.
+    pa_col = next((c for c in ['PA', 'G'] if c in fg.columns), None)
+    if pa_col:
+        fg = (fg.sort_values(pa_col, ascending=False)
+                .drop_duplicates(subset='batter_id', keep='first')
+                .reset_index(drop=True))
+
+    fg = add_ids(fg, reg, join_key='key_mlbam')
+
+    identity = {'batter_id', 'batter_name', 'Name', 'Team', 'Tm',
+                'Season', 'Age', 'Lev'}
+    fg = fg.rename(columns={
+        c: f'fg_{c}' for c in fg.columns
+        if c not in identity and not c.startswith('fg_')
+    })
+
+    print(f'  BRef fallback usable: {len(fg):,} rows, '
+          f'{len([c for c in fg.columns if c.startswith("fg_")])} fg_ columns')
+    print('  NOTE: these are Baseball Reference season stats, NOT FanGraphs. '
+          'wRC+, WAR and FanGraphs batted-ball rates are unavailable.')
+    return fg
+
+
 def pull_fangraphs(start_dt: str, end_dt: str,
                    min_pa: int, reg: pd.DataFrame) -> pd.DataFrame:
     """
@@ -163,10 +212,17 @@ def pull_fangraphs(start_dt: str, end_dt: str,
             from pybaseball import batting_stats_bref
             fg = batting_stats_bref(start_year)
             fg['Season'] = start_year
-            print(f'  FanGraphs BRef fallback: {len(fg):,} rows')
+            print(f'  BRef season fallback: {len(fg):,} rows')
         except Exception as e2:
             print(f'  FanGraphs fallback also failed: {e2}')
+            print('  NOTE: output will have ZERO fg_ columns.')
             return pd.DataFrame()
+
+        # The fallback is keyed by MLBAM ID ('mlbID'), not by a FanGraphs ID,
+        # so it cannot go through the key_fangraphs bridge below. Handle it
+        # here and return early. Columns still get the fg_ prefix so the
+        # merge and the coverage report treat this as the same source slot.
+        return _finish_bref_season_fallback(fg, reg)
 
     # FanGraphs uses 'IDfg' as the player ID column
     id_col = None
@@ -177,6 +233,7 @@ def pull_fangraphs(start_dt: str, end_dt: str,
 
     if id_col is None:
         print(f'  WARNING: could not find FG ID column. Columns: {fg.columns.tolist()}')
+        print('  NOTE: output will have ZERO fg_ columns.')
         return pd.DataFrame()
 
     fg = fg.rename(columns={id_col: 'key_fangraphs'})
@@ -489,6 +546,7 @@ def coverage_report(merged: pd.DataFrame, out_path: str):
     """
     prefixes = {
         'FanGraphs':         'fg_',
+        'BRef range':        'br_',
         'EV/barrels':        'ev_',
         'Expected stats':    'xst_',
         'Percentile ranks':  'pct_',
@@ -593,7 +651,8 @@ def main():
 
     # ── Quick preview ─────────────────────────────────────────────────────────
     print('\nColumn groups in output:')
-    for prefix, label in [('fg_', 'FanGraphs'), ('ev_', 'EV/barrels'),
+    for prefix, label in [('fg_', 'FanGraphs'), ('br_', 'BRef range'),
+                           ('ev_', 'EV/barrels'),
                            ('xst_', 'Expected'), ('pct_', 'Percentile')]:
         cols = [c for c in merged.columns if c.startswith(prefix)]
         print(f'  {label}: {len(cols)} columns')

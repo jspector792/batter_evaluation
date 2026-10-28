@@ -5,6 +5,10 @@
 !.gitignore
 !code/
 !sbatch_scripts/
+
+# Un-ignore data/ itself, ignore its contents, then re-include specific items
+!data/
+data/*
 !data/all_pitches_2025/
 !data/batter_stats_2025.csv
 !data/batter_stats_2026.csv
@@ -12,3 +16,4 @@
 # Within tracked dirs, still ignore common junk
 code/**/.DS_Store
 sbatch_scripts/**/.DS_Store
+data/**/.DS_Store

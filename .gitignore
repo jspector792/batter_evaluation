@@ -5,7 +5,7 @@
 !.gitignore
 !code/
 !sbatch_scripts/
-!data/all_pitches_2025
+!data/all_pitches_2025/
 !data/batter_stats_2025.csv
 !data/batter_stats_2026.csv
 
